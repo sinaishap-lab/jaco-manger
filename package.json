@@ -1,0 +1,17 @@
+{
+  "name": "jaco-manger",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pricing, procurement and profitability system for a print & fabrication business",
+  "packageManager": "pnpm@10.33.0",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck",
+    "dev": "pnpm --parallel --filter api --filter web dev",
+    "db:start": "bash scripts/db-start.sh",
+    "db:stop": "bash scripts/db-stop.sh",
+    "db:reset": "pnpm --filter api db:reset"
+  }
+}

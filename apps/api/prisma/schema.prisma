@@ -1,0 +1,730 @@
+// Pricing, procurement, profitability and product information system.
+// Source of truth for requirements: /SPEC.md (section references below, e.g. §19).
+//
+// Money columns are NUMERIC(18,6) and ratios NUMERIC(9,6) per §59 — never float.
+// No business value is hard-coded here or in application logic (§70); defaults live in seed.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── enums ─────────────────────────────
+
+/// §11 material pricing units
+enum PricingUnit {
+  SQM
+  LINEAR_METER
+  UNIT
+  KG
+  LITER
+  HOUR
+}
+
+/// §20 product pricing methods
+enum PricingMethod {
+  SQM
+  LINEAR_METER
+  UNIT
+  KG
+  HOUR
+  CUSTOM
+}
+
+/// §8 labor calculation methods
+enum LaborMethod {
+  PERCENT
+  HOURLY
+  COMBINED
+}
+
+/// §16 inbound freight models
+enum ShippingType {
+  FLAT
+  PER_QUANTITY
+  FREE_ABOVE
+  BY_WEIGHT
+  BY_AREA
+}
+
+/// How supplier freight is charged to a quote. AMORTIZED spreads it over
+/// purchaseLotQuantity (§62's own method); FULL_ORDER loads all of it.
+enum ShippingAllocation {
+  AMORTIZED
+  FULL_ORDER
+}
+
+/// §37 additional cost scopes
+enum AdditionalCostScope {
+  FIXED_ORDER
+  VARIABLE_UNIT
+  VARIABLE_AREA
+}
+
+/// §57 permissions
+enum Role {
+  ADMIN
+  USER
+}
+
+/// §79 product lifecycle
+enum LifecycleStatus {
+  DRAFT
+  ACTIVE
+  DISCONTINUED
+}
+
+/// §77 attribute dictionary
+enum AttributeGroup {
+  TECHNICAL
+  PRINT
+  FINISHING
+  FINANCIAL
+  MARKETING
+  LOGISTICS
+}
+
+enum AttributeDataType {
+  TEXT
+  LONG_TEXT
+  NUMBER
+  BOOLEAN
+  ENUM
+  DATE
+}
+
+enum EntityType {
+  PRODUCT
+  MATERIAL
+  SUPPLIER
+}
+
+/// §78 media kinds
+enum MediaKind {
+  IMAGE
+  DATASHEET
+  CERTIFICATE
+  CONTRACT
+  SUPPLIER_PRICE_LIST
+  MOCKUP
+  OTHER
+}
+
+/// §80 supplier contact roles
+enum ContactRole {
+  SALES
+  SUPPORT
+  ACCOUNTING
+  LOGISTICS
+  OTHER
+}
+
+/// §81 sales channels
+enum ChannelType {
+  WEBSITE
+  POS
+  PRICE_LIST
+  MARKETPLACE
+  OTHER
+}
+
+enum PublicationStatus {
+  NOT_PUBLISHED
+  PENDING
+  PUBLISHED
+  ERROR
+}
+
+enum SyncChangeType {
+  CREATED
+  UPDATED
+  DELETED
+  PRICE_CHANGED
+  MEDIA_CHANGED
+}
+
+// ──────────────────────── business settings ────────────────────────
+
+/// §4, §5 — single row. Every business value the engine uses comes from here (§70).
+model BusinessSettings {
+  id           String @id @default("singleton")
+  businessName String @default("")
+  currency     String @default("ILS")
+
+  /// §5 VAT_RATE — percent, e.g. 18
+  vatRate                    Decimal  @db.Decimal(9, 6)
+  /// §5 AVERAGE_SALES_INCL_VAT
+  averageSalesInclVat        Decimal  @db.Decimal(18, 6)
+  /// §5 AVERAGE_WAGES
+  averageWages               Decimal  @db.Decimal(18, 6)
+  /// §5 EMPLOYEE_HOURLY_WAGE
+  employeeHourlyWage         Decimal  @db.Decimal(18, 6)
+  /// §5 EMPLOYER_MULTIPLIER
+  employerMultiplier         Decimal  @db.Decimal(9, 6)
+  /// §6 — manual override of the derived labor ratio (fraction, e.g. 0.59)
+  laborRatioOverride         Decimal? @db.Decimal(9, 6)
+  /// §5 MIN_ORDER_INCL_VAT
+  minOrderInclVat            Decimal  @db.Decimal(18, 6)
+  /// §50 target contribution margin (fraction)
+  targetContributionMargin   Decimal  @db.Decimal(9, 6)
+  /// §5 TARGET_SQM_PRICE_INCL_VAT
+  targetSqmPriceInclVat      Decimal  @db.Decimal(18, 6)
+  /// §5 DEFAULT_MATERIAL_COST_PER_SQM — fallback only (§27)
+  defaultMaterialCostPerSqm  Decimal  @db.Decimal(18, 6)
+  /// Fallback lot size for amortizing freight when a price row sets none
+  defaultPurchaseLotQuantity Decimal  @db.Decimal(18, 6)
+  /// Decimal places for customer-facing prices (§59)
+  displayRounding            Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("business_settings")
+}
+
+// ───────────────────────────── suppliers ─────────────────────────────
+
+/// §9 + §80
+model Supplier {
+  id                    String       @id @default(uuid())
+  name                  String
+  contactName           String?
+  phone                 String?
+  email                 String?
+  website               String?
+  taxId                 String?
+  paymentTerms          String?
+  /// §9 default freight charge
+  deliveryCost          Decimal      @default(0) @db.Decimal(18, 6)
+  minimumOrderValue     Decimal      @default(0) @db.Decimal(18, 6)
+  shippingType          ShippingType @default(FLAT)
+  freeShippingThreshold Decimal?     @db.Decimal(18, 6)
+
+  // §80 extended supplier card
+  addressBilling   String?
+  addressWarehouse String?
+  /// 1..5
+  qualityRating    Int?
+  leadTimeDays     Int?
+  creditLimit      Decimal? @db.Decimal(18, 6)
+  isPreferred      Boolean  @default(false)
+  certifications   String?
+
+  active    Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  materialPrices      SupplierMaterialPrice[]
+  contacts            SupplierContact[]
+  catalogEntries      SupplierMaterial[]
+  defaultForMaterials Material[]              @relation("MaterialDefaultSupplier")
+
+  @@index([active])
+  @@map("suppliers")
+}
+
+/// §80 — a supplier may have several contacts
+model SupplierContact {
+  id         String      @id @default(uuid())
+  supplierId String
+  name       String
+  role       ContactRole @default(SALES)
+  phone      String?
+  email      String?
+  notes      String?
+  isPrimary  Boolean     @default(false)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([supplierId])
+  @@map("supplier_contacts")
+}
+
+// ───────────────────────────── materials ─────────────────────────────
+
+/// §10 — deliberately holds NO purchase price; prices live per supplier (§2, §12)
+model Material {
+  id                String      @id @default(uuid())
+  name              String
+  materialType      String?
+  pricingUnit       PricingUnit
+  defaultSupplierId String?
+
+  // §79-style technical identity for raw material
+  sku            String?  @unique
+  thicknessMm    Decimal? @db.Decimal(9, 3)
+  finish         String?
+  color          String?
+  sheetWidthCm   Decimal? @db.Decimal(9, 3)
+  sheetHeightCm  Decimal? @db.Decimal(9, 3)
+  weightKgPerSqm Decimal? @db.Decimal(18, 6)
+  isPrintable    Boolean  @default(true)
+  isOutdoorRated Boolean  @default(false)
+
+  active    Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  defaultSupplier Supplier?               @relation("MaterialDefaultSupplier", fields: [defaultSupplierId], references: [id], onDelete: SetNull)
+  prices          SupplierMaterialPrice[]
+  products        Product[]
+  catalogEntries  SupplierMaterial[]
+
+  @@index([active])
+  @@map("materials")
+}
+
+/// §80 — the supplier's own catalog identity for a material.
+/// Separate from price rows so a SKU is not duplicated on every price change (§17).
+model SupplierMaterial {
+  id                  String   @id @default(uuid())
+  supplierId          String
+  materialId          String
+  supplierSku         String?
+  supplierProductName String?
+  packSize            Decimal? @db.Decimal(18, 6)
+  packUnit            String?
+  leadTimeDays        Int?
+  isPreferred         Boolean  @default(false)
+  active              Boolean  @default(true)
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  material Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, materialId])
+  @@map("supplier_materials")
+}
+
+/// §12 — serves BOTH quantity tiers (§13) and price history (§17).
+/// APPEND-ONLY: never UPDATE unitPrice. A change closes validUntil and inserts a new row.
+model SupplierMaterialPrice {
+  id         String      @id @default(uuid())
+  supplierId String
+  materialId String
+  unit       PricingUnit
+  unitPrice  Decimal     @db.Decimal(18, 6)
+  currency   String      @default("ILS")
+
+  /// §13 tier bounds in `unit`; maximumQuantity null = open-ended
+  minimumQuantity Decimal  @default(0) @db.Decimal(18, 6)
+  maximumQuantity Decimal? @db.Decimal(18, 6)
+
+  /// §16 freight for this price row (overrides the supplier default when set)
+  deliveryCost           Decimal?      @db.Decimal(18, 6)
+  shippingType           ShippingType?
+  freeShippingThreshold  Decimal?      @db.Decimal(18, 6)
+  /// Lot size freight is amortized over (C2). Falls back to settings.
+  purchaseLotQuantity    Decimal?      @db.Decimal(18, 6)
+  /// Needed for ShippingType.BY_WEIGHT
+  weightKgPerUnit        Decimal?      @db.Decimal(18, 6)
+  /// Non-freight per-order surcharge (§15 supplier_additional_costs)
+  additionalCostPerOrder Decimal       @default(0) @db.Decimal(18, 6)
+  /// §27/§35 — true means printing is already inside unitPrice, so printingCost must be 0
+  includesPrinting       Boolean       @default(false)
+
+  /// §17 validity window; validUntil null = currently in force
+  validFrom      DateTime  @default(now())
+  validUntil     DateTime?
+  supersededById String?   @unique
+
+  isDefault Boolean  @default(false)
+  active    Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  supplier     Supplier               @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  material     Material               @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  supersededBy SupplierMaterialPrice? @relation("PriceSupersession", fields: [supersededById], references: [id], onDelete: SetNull)
+  supersedes   SupplierMaterialPrice? @relation("PriceSupersession")
+
+  @@index([materialId, supplierId, validFrom, validUntil])
+  @@index([materialId, active])
+  @@map("supplier_material_prices")
+}
+
+// ───────────────────────────── products ─────────────────────────────
+
+/// §76 — hierarchical catalog tree
+model ProductCategory {
+  id          String   @id @default(uuid())
+  name        String
+  parentId    String?
+  description String?
+  sortOrder   Int      @default(0)
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  parent   ProductCategory?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children ProductCategory[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([parentId])
+  @@map("product_categories")
+}
+
+/// §19 pricing fields + §79 PIM fields.
+/// Live cost/contribution/recommended price are NOT stored — they come from the engine (§58).
+model Product {
+  id            String        @id @default(uuid())
+  name          String
+  materialId    String?
+  pricingMethod PricingMethod
+  laborMethod   LaborMethod   @default(PERCENT)
+  basePrice     Decimal?      @db.Decimal(18, 6)
+  /// §19 per-product target margin (fraction); falls back to settings
+  targetMargin  Decimal?      @db.Decimal(9, 6)
+  /// §25 per-product minimum order incl. VAT; falls back to settings
+  minimumOrder  Decimal?      @db.Decimal(18, 6)
+
+  // Cost drivers that produce the small-format premium (§31, C7)
+  setupFee            Decimal @default(0) @db.Decimal(18, 6)
+  handlingCostPerUnit Decimal @default(0) @db.Decimal(18, 6)
+  /// §35 charged only when the supplier price does not already include printing
+  printingCostPerSqm  Decimal @default(0) @db.Decimal(18, 6)
+  /// §36 either per unit or by hours
+  cuttingCostPerUnit  Decimal @default(0) @db.Decimal(18, 6)
+  cuttingHoursPerUnit Decimal @default(0) @db.Decimal(18, 6)
+  /// §8B/§8C
+  laborHoursPerUnit   Decimal @default(0) @db.Decimal(18, 6)
+  laborFixedCost      Decimal @default(0) @db.Decimal(18, 6)
+
+  // §79 identity
+  sku             String?         @unique
+  displayName     String?
+  categoryId      String?
+  lifecycleStatus LifecycleStatus @default(DRAFT)
+  launchedAt      DateTime?
+  discontinuedAt  DateTime?
+
+  // §79 technical
+  minWidthCm       Decimal? @db.Decimal(9, 3)
+  maxWidthCm       Decimal? @db.Decimal(9, 3)
+  minHeightCm      Decimal? @db.Decimal(9, 3)
+  maxHeightCm      Decimal? @db.Decimal(9, 3)
+  isOutdoor        Boolean  @default(false)
+  warrantyMonths   Int?
+  leadTimeDays     Int?
+  fileRequirements String?
+  careInstructions String?
+  productionNotes  String?
+
+  // §79 financial
+  accountingCode String?
+  costCenter     String?
+  vatCategory    String?
+
+  // §79 marketing
+  shortDescription String?
+  longDescription  String?
+  sellingPoints    String[] @default([])
+  useCases         String?
+  seoSlug          String?  @unique
+  seoTitle         String?
+  seoDescription   String?
+
+  active    Boolean  @default(true)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  material        Material?                   @relation(fields: [materialId], references: [id], onDelete: SetNull)
+  category        ProductCategory?            @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  sizes           ProductSize[]
+  quantityTiers   QuantityTier[]
+  additionalCosts AdditionalCostItem[]
+  tags            ProductTag[]
+  publications    ProductChannelPublication[]
+
+  @@index([categoryId])
+  @@index([lifecycleStatus])
+  @@index([active])
+  @@map("products")
+}
+
+/// §21 — areaSqm is deliberately NOT stored. It is derived from width x height
+/// by @jaco/core per §22, so the stored and computed values can never diverge (C9).
+model ProductSize {
+  id        String   @id @default(uuid())
+  productId String
+  name      String
+  widthCm   Decimal  @db.Decimal(9, 3)
+  heightCm  Decimal  @db.Decimal(9, 3)
+  depthCm   Decimal? @db.Decimal(9, 3)
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, name])
+  @@index([productId, active])
+  @@map("product_sizes")
+}
+
+// ───────────────────────── sell-side price lists ─────────────────────────
+
+/// §55
+model PriceListVersion {
+  id        String   @id @default(uuid())
+  name      String
+  isActive  Boolean  @default(false)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tiers QuantityTier[]
+
+  @@map("price_list_versions")
+}
+
+/// §23 + §55 link (C8). Last tier is 301+ : maxQuantity null (C3).
+model QuantityTier {
+  id                 String   @id @default(uuid())
+  priceListVersionId String
+  productId          String
+  productSizeId      String?
+  minQuantity        Int
+  /// null = open-ended upper bound
+  maxQuantity        Int?
+  unitPriceInclVat   Decimal  @db.Decimal(18, 6)
+  active             Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  priceListVersion PriceListVersion @relation(fields: [priceListVersionId], references: [id], onDelete: Cascade)
+  product          Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([priceListVersionId, productId, productSizeId, minQuantity])
+  @@map("quantity_tiers")
+}
+
+/// §37
+model AdditionalCostItem {
+  id        String              @id @default(uuid())
+  productId String?
+  name      String
+  scope     AdditionalCostScope
+  amount    Decimal             @db.Decimal(18, 6)
+  active    Boolean             @default(true)
+  notes     String?
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  product Product? @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId, active])
+  @@map("additional_cost_items")
+}
+
+// ───────────────────────── quotes (immutable) ─────────────────────────
+
+/// §53 reporting columns + §18/§54 full snapshot. Never updated after insert (C13).
+model Quote {
+  id       String   @id @default(uuid())
+  quotedAt DateTime @default(now())
+
+  productId       String?
+  productName     String
+  productSizeId   String?
+  productSizeName String?
+  quantity        Int
+
+  supplierId    String?
+  supplierName  String?
+  purchasePrice Decimal? @db.Decimal(18, 6)
+  purchaseUnit  String?
+  shippingCost  Decimal  @default(0) @db.Decimal(18, 6)
+
+  unitPriceInclVat  Decimal @db.Decimal(18, 6)
+  totalPriceInclVat Decimal @db.Decimal(18, 6)
+  totalPriceExVat   Decimal @db.Decimal(18, 6)
+
+  materialCost   Decimal @db.Decimal(18, 6)
+  printingCost   Decimal @db.Decimal(18, 6)
+  cuttingCost    Decimal @db.Decimal(18, 6)
+  laborCost      Decimal @db.Decimal(18, 6)
+  additionalCost Decimal @db.Decimal(18, 6)
+  totalCost      Decimal @db.Decimal(18, 6)
+
+  contribution       Decimal @db.Decimal(18, 6)
+  contributionMargin Decimal @db.Decimal(9, 6)
+
+  /// §54 — complete input, settings, formulas and output as calculated
+  snapshot      Json
+  engineVersion String
+
+  notes     String?
+  createdAt DateTime @default(now())
+
+  @@index([quotedAt])
+  @@index([productId])
+  @@map("quotes")
+}
+
+// ─────────────────── PIM: attributes, media, tags ───────────────────
+
+/// §77 — the dictionary. New technical specs are added here, never as new columns.
+model AttributeDefinition {
+  id                String            @id @default(uuid())
+  key               String            @unique
+  label             String
+  attributeGroup    AttributeGroup
+  dataType          AttributeDataType
+  unit              String?
+  enumOptions       String[]          @default([])
+  appliesTo         EntityType
+  isRequired        Boolean           @default(false)
+  /// §81/§82 — only customer-visible attributes leave the system
+  isCustomerVisible Boolean           @default(false)
+  sortOrder         Int               @default(0)
+  active            Boolean           @default(true)
+  description       String?
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  values AttributeValue[]
+
+  @@index([appliesTo, attributeGroup])
+  @@map("attribute_definitions")
+}
+
+/// §77 — typed columns so numeric specs stay filterable and sortable
+model AttributeValue {
+  id           String     @id @default(uuid())
+  definitionId String
+  entityType   EntityType
+  entityId     String
+  valueText    String?
+  valueNumber  Decimal?   @db.Decimal(18, 6)
+  valueBoolean Boolean?
+  valueDate    DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  definition AttributeDefinition @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+
+  @@unique([definitionId, entityType, entityId])
+  @@index([entityType, entityId])
+  @@index([definitionId, valueNumber])
+  @@map("attribute_values")
+}
+
+/// §78 — files live on local disk; this row is the catalog entry
+model MediaAsset {
+  id                String     @id @default(uuid())
+  entityType        EntityType
+  entityId          String
+  kind              MediaKind  @default(IMAGE)
+  filePath          String
+  originalFilename  String
+  mimeType          String
+  sizeBytes         Int
+  widthPx           Int?
+  heightPx          Int?
+  altText           String?
+  title             String?
+  isPrimary         Boolean    @default(false)
+  isCustomerVisible Boolean    @default(true)
+  sortOrder         Int        @default(0)
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  @@index([entityType, entityId, kind])
+  @@map("media_assets")
+}
+
+/// §79
+model Tag {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  color     String?
+  createdAt DateTime @default(now())
+
+  products ProductTag[]
+
+  @@map("tags")
+}
+
+model ProductTag {
+  productId String
+  tagId     String
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([productId, tagId])
+  @@map("product_tags")
+}
+
+// ───────────────── §81 channels: system is source of truth ─────────────────
+
+model SalesChannel {
+  id          String      @id @default(uuid())
+  name        String
+  channelType ChannelType
+  isActive    Boolean     @default(false)
+  /// Adapter configuration (endpoint, mapping). Credentials belong in env, not here.
+  config      Json        @default("{}")
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  publications ProductChannelPublication[]
+
+  @@map("sales_channels")
+}
+
+/// §81 — publication state of one product on one channel
+model ProductChannelPublication {
+  id                   String            @id @default(uuid())
+  productId            String
+  channelId            String
+  status               PublicationStatus @default(NOT_PUBLISHED)
+  /// The product's id in the external system
+  externalId           String?
+  priceOverrideInclVat Decimal?          @db.Decimal(18, 6)
+  publishedAt          DateTime?
+  lastSyncedAt         DateTime?
+  lastError            String?
+  /// Hash of the last payload sent, so unchanged products are not re-pushed
+  payloadHash          String?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  product Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  channel SalesChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, channelId])
+  @@index([channelId, status])
+  @@map("product_channel_publications")
+}
+
+/// §81 Outbox. Written in the same transaction as the change; delivered out of band.
+model SyncEvent {
+  id          String         @id @default(uuid())
+  entityType  EntityType
+  entityId    String
+  changeType  SyncChangeType
+  payload     Json
+  createdAt   DateTime       @default(now())
+  processedAt DateTime?
+  attempts    Int            @default(0)
+  error       String?
+
+  @@index([processedAt, createdAt])
+  @@index([entityType, entityId])
+  @@map("sync_events")
+}
