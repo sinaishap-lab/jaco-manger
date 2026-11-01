@@ -58,6 +58,22 @@ const PROFITABILITY_FIELDS = [
   "derivedSettings",
 ] as const;
 
+/**
+ * §57 — engine warnings a USER may see.
+ *
+ * Removing the cost fields is not enough on its own: a warning's text carries
+ * figures. "Contribution is negative (-43.65)" states the contribution in prose,
+ * and the supplier-minimum warning states what the purchase is worth. So warnings
+ * are allow-listed by code rather than filtered by wording, and anything that
+ * reports on cost, margin, suppliers or freight is withheld.
+ */
+const USER_VISIBLE_WARNINGS = new Set([
+  "MINIMUM_ORDER_APPLIED",
+  "QUANTITY_OUTSIDE_TIERS",
+  "OVERLAPPING_TIERS",
+  "AREA_NOT_AVAILABLE",
+]);
+
 export function stripProfitability<T extends Record<string, unknown>>(
   payload: T,
   role: Role,
@@ -66,6 +82,21 @@ export function stripProfitability<T extends Record<string, unknown>>(
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(payload)) {
     if ((PROFITABILITY_FIELDS as readonly string[]).includes(key)) continue;
+
+    if (key === "warnings" && Array.isArray(value)) {
+      out[key] = value.filter(
+        (w): w is { code: string } =>
+          typeof w === "object" &&
+          w !== null &&
+          "code" in w &&
+          USER_VISIBLE_WARNINGS.has(String((w as { code: unknown }).code)),
+      );
+      continue;
+    }
+
+    // A snapshot holds the whole calculation, costs included (§54).
+    if (key === "snapshot") continue;
+
     out[key] = value;
   }
   return out as Partial<T>;

@@ -174,6 +174,23 @@ hidden = ("materialCost", "totalCost", "contribution", "contributionMargin", "su
 check("a USER sees the sale price", user_view.get("totalPriceInclVat") == "570")
 check("a USER sees no cost or margin field",
       all(k not in user_view for k in hidden))
+
+# Field names are not the only way a figure escapes: a warning states it in prose.
+admin_contribution = admin_view["contribution"]
+leaked = [w for w in user_view.get("warnings", [])
+          if w["code"] not in {"MINIMUM_ORDER_APPLIED", "QUANTITY_OUTSIDE_TIERS",
+                               "OVERLAPPING_TIERS", "AREA_NOT_AVAILABLE"}]
+check("a USER receives no cost-bearing warning",
+      leaked == [], f"{[w['code'] for w in leaked]}")
+blob = json.dumps(user_view, ensure_ascii=False)
+rounded = str(D(admin_contribution).quantize(D("0.01")))
+check("the contribution figure appears nowhere in a USER payload",
+      rounded not in blob and admin_contribution not in blob,
+      f"looked for {rounded}")
+_, user_quotes = call("GET", "/quotes?limit=5", role="USER")
+check("a saved quote shows a USER no snapshot and no contribution",
+      all("snapshot" not in q and "contribution" not in q for q in user_quotes),
+      f"{len(user_quotes)} rows checked")
 check("an ADMIN sees them all", all(k in admin_view for k in hidden))
 status, _ = call("GET", f"/suppliers/compare?materialId={material['id']}&quantity=50", role="USER")
 check("a USER is refused supplier comparison", status == 403, f"HTTP {status}")
